@@ -1,0 +1,266 @@
+import tkinter as tk
+from tkinter import messagebox, scrolledtext
+from ttkbootstrap import Style
+from ttkbootstrap.widgets import Entry, Button, Progressbar, Checkbutton, Notebook
+from ttkbootstrap.constants import *
+from zapv2 import ZAPv2
+import threading
+import time
+import os
+import webbrowser
+import json
+from datetime import datetime
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from tkinterweb import HtmlFrame
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas as pdf_canvas
+
+API_KEY = 'h2rnc3lcm7f1ct87sfhs286ocp'
+ZAP_PROXY = 'http://127.0.0.1:8080'
+zap = ZAPv2(apikey=API_KEY, proxies={'http': ZAP_PROXY, 'https': ZAP_PROXY})
+
+CONFIG_FILE = "settings.json"
+def load_theme():
+    try:
+        with open(CONFIG_FILE, 'r') as f:
+            return json.load(f).get("theme", "flatly")
+    except:
+        return "flatly"
+
+def save_theme(theme):
+    with open(CONFIG_FILE, 'w') as f:
+        json.dump({"theme": theme}, f)
+
+current_theme = load_theme()
+
+RISK_COLORS = {
+    'Informational': 'gray',
+    'Low': 'green',
+    'Medium': 'orange',
+    'High': 'red',
+    'Critical': 'darkred'
+}
+
+def get_risk_color(risk_level):
+    return RISK_COLORS.get(risk_level, 'black')
+
+def show_zap_report_in_tab(viewer_widget):
+    try:
+        html_report = zap.core.htmlreport()
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        os.makedirs("reports", exist_ok=True)
+        report_path = os.path.abspath(f"reports/zap_scan_report_{timestamp}.html")
+        with open(report_path, 'w', encoding='utf-8') as f:
+            f.write(html_report)
+        viewer_widget.load_file(report_path)
+    except Exception as e:
+        messagebox.showerror("Report Error", str(e))
+
+def open_report_folder():
+    report_dir = os.path.abspath("reports")
+    os.makedirs(report_dir, exist_ok=True)
+    webbrowser.open(f"file://{report_dir}")
+
+def generate_pdf_report():
+    try:
+        alerts = zap.core.alerts()
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        os.makedirs("reports", exist_ok=True)
+        pdf_path = os.path.abspath(f"reports/zap_alerts_report_{timestamp}.pdf")
+
+        c = pdf_canvas.Canvas(pdf_path, pagesize=letter)
+        width, height = letter
+        y = height - 40
+
+        c.setFont("Helvetica-Bold", 16)
+        c.drawString(30, y, "ZAP Scan Report")
+        y -= 30
+        c.setFont("Helvetica", 12)
+        c.drawString(30, y, f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        y -= 40
+
+        for alert in alerts:
+            risk = alert.get('risk', 'N/A')
+            name = alert.get('alert', 'N/A')
+            url = alert.get('url', 'N/A')
+            desc = alert.get('description', 'N/A')[:300]
+            c.setFont("Helvetica-Bold", 12)
+            c.drawString(30, y, f"[{risk}] {name}")
+            y -= 20
+            c.setFont("Helvetica", 10)
+            c.drawString(40, y, f"URL: {url}")
+            y -= 15
+            c.drawString(40, y, f"Description: {desc}")
+            y -= 40
+            if y < 100:
+                c.showPage()
+                y = height - 40
+
+        c.save()
+        messagebox.showinfo("PDF Report", f"PDF report saved to:\n{pdf_path}")
+        webbrowser.open(f"file://{pdf_path}")
+    except Exception as e:
+        messagebox.showerror("PDF Generation Error", str(e))
+
+def scan_offline(url, output, progress_bar, risk_frame, chart_elements):
+    fig, ax, canvas = chart_elements
+    try:
+        zap.urlopen(url)
+        time.sleep(2)
+        zap.ascan.disable_all_scanners()
+
+        extended_scanners = ",".join([
+            "40012", "40014",  # XSS
+            "40018", "40019",  # SQLi
+            "40017",           # RFI
+            "6", "7",          # Path Traversal
+            "90021",           # Command Injection
+            "90023",           # XXE
+            "90026",           # SSI
+            "90027",           # LDAP Injection
+            "10049"            # CORS
+        ])
+        zap.ascan.enable_scanners(extended_scanners)
+
+        output.insert(tk.END, "\n🔍 Starting scan with extended modules...\n")
+        scan_id = zap.ascan.scan(url)
+
+        start_time = time.time()
+        timeout = 300
+        last_progress = -1
+
+        total_alerts_counts, times = [], []
+        for widget in risk_frame.winfo_children():
+            widget.destroy()
+
+        risk_summary = {k: 0 for k in RISK_COLORS.keys()}
+        cycle = 0
+
+        while True:
+            progress = int(zap.ascan.status(scan_id))
+            if progress != last_progress:
+                output.insert(tk.END, f"⏳ Scan progress: {progress}%\n")
+                progress_bar['value'] = progress
+                output.see(tk.END)
+                last_progress = progress
+
+            alerts = zap.core.alerts(baseurl=url)
+            total_alerts = len(alerts)
+
+            for k in risk_summary:
+                risk_summary[k] = sum(1 for a in alerts if a['risk'] == k)
+
+            for widget in risk_frame.winfo_children():
+                widget.destroy()
+            for risk_level, count in risk_summary.items():
+                if count > 0:
+                    lbl = tk.Label(risk_frame, text=f"{risk_level}: {count}", fg="white", bg=get_risk_color(risk_level), font=("Segoe UI", 10, "bold"), padx=8, pady=4)
+                    lbl.pack(side=tk.LEFT, padx=5)
+
+            cycle += 1
+            times.append(cycle)
+            total_alerts_counts.append(total_alerts)
+
+            if len(times) > 30:
+                times.pop(0)
+                total_alerts_counts.pop(0)
+
+            ax.clear()
+            ax.plot(times, total_alerts_counts, label='Total Alerts', color='crimson', linewidth=2, marker='o')
+            ax.set_title('Live Alert Count')
+            ax.set_xlabel('Cycle')
+            ax.set_ylabel('Alerts')
+            ax.legend(loc='upper left')
+            ax.grid(True)
+            fig.tight_layout()
+            canvas.draw()
+
+            if progress >= 100:
+                break
+            if time.time() - start_time > timeout:
+                output.insert(tk.END, "\n⏰ Scan timed out.\n")
+                break
+            time.sleep(3)
+
+        output.insert(tk.END, "✅ Scan complete!\n")
+    except Exception as e:
+        messagebox.showerror("Offline Scan Error", str(e))
+
+def start_scan(entry, output, progress_bar, risk_frame, chart_elements):
+    target = entry.get().strip()
+    output.delete("1.0", tk.END)
+    progress_bar['value'] = 0
+    for widget in risk_frame.winfo_children():
+        widget.destroy()
+    if not target.startswith("http"):
+        messagebox.showwarning("Invalid URL", "URL must start with http:// or https://")
+        return
+    threading.Thread(target=scan_offline, args=(target, output, progress_bar, risk_frame, chart_elements), daemon=True).start()
+
+def main_gui():
+    style = Style(theme=current_theme)
+    root = style.master
+    root.title("🛡️ Cybersecurity Dashboard")
+    root.geometry("1200x720")
+
+    notebook = Notebook(root)
+    notebook.pack(fill="both", expand=True)
+
+    # Dashboard Tab
+    dashboard_tab = tk.Frame(notebook)
+    notebook.add(dashboard_tab, text="Dashboard")
+
+    top_frame = tk.Frame(dashboard_tab)
+    top_frame.pack(side=tk.TOP, fill="x", pady=10)
+
+    sidebar = tk.Frame(top_frame, padx=15, pady=10)
+    sidebar.pack(side=tk.LEFT, fill="y")
+
+    tk.Label(sidebar, text="🔗 Website URL", font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=5)
+    url_entry = Entry(sidebar, width=35)
+    url_entry.pack(pady=5)
+
+    progress_bar = Progressbar(sidebar, bootstyle="info-striped", length=250)
+    progress_bar.pack(pady=10)
+
+    Button(sidebar, text="🔍 Start Scan", bootstyle=SUCCESS, command=lambda: start_scan(url_entry, output_box, progress_bar, risk_frame, (fig, ax, canvas))).pack(pady=5, fill="x")
+    # Removed: View Report button
+    Button(sidebar, text="📂 Open Folder", bootstyle=PRIMARY, command=open_report_folder).pack(pady=5, fill="x")
+    Checkbutton(sidebar, text="🌙 Dark Mode", command=lambda: toggle_theme(style)).pack(pady=10)
+
+    output_box = scrolledtext.ScrolledText(dashboard_tab, height=12, font=("Consolas", 10))
+    output_box.pack(fill="x", padx=20, pady=5)
+
+    risk_frame = tk.Frame(dashboard_tab)
+    risk_frame.pack(pady=10)
+
+    fig, ax = plt.subplots(figsize=(8.5, 3))
+    canvas = FigureCanvasTkAgg(fig, master=dashboard_tab)
+    canvas.get_tk_widget().pack(fill="x", padx=20, pady=10)
+
+    # Report Tab
+    report_tab = tk.Frame(notebook)
+    notebook.add(report_tab, text="Report")
+
+    report_top = tk.Frame(report_tab)
+    report_top.pack(fill="x", pady=10)
+
+    Button(report_top, text="📄 Generate & View Report", bootstyle=INFO, command=lambda: show_zap_report_in_tab(report_viewer)).pack(side=tk.LEFT, padx=10)
+    Button(report_top, text="📂 Open Folder", bootstyle=PRIMARY, command=open_report_folder).pack(side=tk.LEFT)
+    Button(report_top, text="📝 Export PDF", bootstyle=WARNING, command=generate_pdf_report).pack(side=tk.LEFT, padx=10)
+
+    global report_viewer
+    report_viewer = HtmlFrame(report_tab, messages_enabled=False)
+    report_viewer.pack(fill="both", expand=True, padx=10, pady=10)
+
+    root.mainloop()
+
+def toggle_theme(style):
+    global current_theme
+    current_theme = "darkly" if current_theme == "flatly" else "flatly"
+    style.theme_use(current_theme)
+    save_theme(current_theme)
+
+if __name__ == "__main__":
+    main_gui()
